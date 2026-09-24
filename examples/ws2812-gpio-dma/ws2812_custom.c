@@ -14,14 +14,15 @@
  * Architecture:
  * - Double buffer: 2 × 504 phases, ISR chains next block on TFR interrupt
  * - One immutable frame snapshot protects the in-flight frame from later writes
- * - A high-priority ChibiOS worker refills the just-released DMA buffer
- * - The ISR only chains the prepared buffer and wakes the worker; encoding
- *   never runs in interrupt context
+ * - A high-priority ChibiOS worker refills each released DMA buffer
+ * - The ISR chains only already-prepared buffers and wakes the worker only
+ *   when a refill or final frame completion must be handled; encoding never
+ *   runs in interrupt context
  * - Block size 504: ≤511 hardware max, divisible by 24 (wire-byte alignment)
  * - Reset: 300µs sleep in the worker after final DMA block (pin already LOW)
  *
  * Timing (3 phases per bit at 72MHz, PSC=0, ARR=WS2812_PHASE_TICKS-1):
- *   Default 25 ticks = 347ns per phase (configurable via WS2812_PHASE_TICKS).
+ *   Default 27 ticks = 375ns per phase (configurable via WS2812_PHASE_TICKS).
  *   Phase 1: Always SET (go high)
  *   Phase 2: Bit 0: RESET (go low), Bit 1: NOP (stay high)
  *   Phase 3: Bit 0: NOP (stay low), Bit 1: RESET (go low)
@@ -38,7 +39,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#if defined(WB32FQ95xB) || defined(WB32FQ95xC)
+#if defined(WB32FQ95xx)
 
 #include "hal.h"
 
@@ -47,11 +48,12 @@
 #    error "WS2812_GPIO_DMA driver requires WS2812_DI_PIN to be defined"
 #endif
 
-/* Guard against exceeding double-buffer capacity.
- * 168 LEDs × 72 phases = 12096 = 24 blocks of 504. Beyond this,
- * the fill-time margin may be insufficient. */
+/* Conservative LED-count limit retained from the original driver. The
+ * streaming double buffer is byte-oriented rather than LED-aligned; for RGB,
+ * 168 LEDs correspond to 12096 phases = 24 blocks of 504. Beyond this, the
+ * refill-time margin may be insufficient. */
 #if WS2812_LED_COUNT > 168
-#    error "WS2812_LED_COUNT exceeds double-buffer capacity (max 168)"
+#    error "WS2812_LED_COUNT exceeds configured driver limit (max 168)"
 #endif
 
 /* GPIO BSRR configuration - extract port and pin from QMK PAL line definition */
@@ -85,7 +87,8 @@
 /* Timing constants at 72MHz.
  * WS2812_PHASE_TICKS controls T0H (one phase HIGH for a zero-bit).
  * Some WS2812 batches reject T0H > ~420ns as a 1-bit (all-white symptom).
- * 25 ticks = 347ns matches the proven bitbang WS2812_T0H=350 timing. */
+ * The default 27 ticks = 375ns; 25 ticks = 347ns is the proven bitbang
+ * WS2812_T0H=350 reference point. */
 #define WS2812_TIMER_FREQ    72000000U
 #ifndef WS2812_PHASE_TICKS
 #    define WS2812_PHASE_TICKS   27U    /* 27 ticks × 13.89ns = 375ns at 72MHz */
@@ -134,10 +137,11 @@ _Static_assert(WS2812_LAST_BLOCK_SIZE <= 511U,
 /* Reset pulse: 300µs sleep in thread context after final DMA block */
 #define WS2812_RESET_US      300U
 
-/* Safety timeout: abort DMA if transfer takes longer than this.
- * Normal 82-LED frame takes ~3ms. Must be shorter than the wireless
- * ACK timeout (MD_SNED_PKT_TIMEOUT = 10ms) to avoid triggering
- * wireless retry/drop logic during DMA stall recovery. */
+/* Base safety timeout. The worker applies it to each expected DMA
+ * block-boundary/final wakeup; flush() allows one additional millisecond while
+ * waiting for ownership of the previous frame. A normal full block takes
+ * ~189µs at 27 ticks, and the base timeout remains shorter than the wireless
+ * ACK timeout (MD_SNED_PKT_TIMEOUT = 10ms) during DMA stall recovery. */
 #define WS2812_TIMEOUT_MS    5U
 
 /* Watermark validation showed the worker touched the same 156 bytes of its
@@ -157,8 +161,9 @@ static uint32_t ws2812_buf[2][WS2812_BLOCK_SIZE];
 ws2812_led_t ws2812_leds[WS2812_LED_COUNT] __attribute__((aligned(sizeof(uint32_t))));
 
 /* Immutable source for the frame currently being transmitted. QMK can update
- * ws2812_leds[] for the next frame while DMA/worker still consume this copy.
- * Keep it word-aligned because LDM/STM require aligned word addresses. */
+ * ws2812_leds[] for the next frame while the worker continues encoding the
+ * in-flight frame from this copy. Keep it word-aligned because LDM/STM require
+ * aligned word addresses. */
 static ws2812_led_t ws2812_frame_leds[WS2812_LED_COUNT]
     __attribute__((aligned(sizeof(uint32_t))));
 
@@ -393,9 +398,8 @@ static void ws2812_dma_callback(void *p, uint32_t flags) {
      * to dmaServeInterrupt() after this callback returns. */
     if ((flags & WB32_DMAC_IT_STATE_TFR) && ws2812_transfer_active) {
         /* Publish the completed-block advance once, then use the local value
-         * throughout this ISR. ws2812_block_idx is volatile because the worker
-         * observes it, so repeatedly reading it would force redundant SRAM
-         * loads for the same block number. */
+         * throughout this ISR. ws2812_block_idx is volatile because it is
+         * shared with interrupt context; avoid redundant SRAM loads here. */
         const uint32_t next_block = ws2812_block_idx + 1U;
         ws2812_block_idx = next_block;
 
@@ -443,10 +447,12 @@ static void ws2812_dma_callback(void *p, uint32_t flags) {
             return;
         }
 
-        /* Wake the high-priority worker only after the next DMA block has
-         * already been chained. It can now refill the released buffer while
-         * hardware transmits the current block. */
-        ws2812_signal_block_worker_from_isr();
+        /* Wake the high-priority worker only when there is another block to
+         * prepare after the one just chained. If the chained block is the last
+         * one, the final TFR will wake the worker to finish the frame instead. */
+        if ((next_block + 1U) < WS2812_BLOCK_COUNT) {
+            ws2812_signal_block_worker_from_isr();
+        }
     }
 }
 
@@ -607,10 +613,11 @@ void ws2812_set_color_all(uint8_t red, uint8_t green, uint8_t blue) {
  * @brief Background refill worker for one immutable frame
  *
  * The worker owns all phase encoding after flush() snapshots ws2812_leds[].
- * It starts the transfer, then sleeps on a semaphore between block boundaries.
- * The DMA ISR remains short: chain the already prepared block, signal worker,
- * return. This keeps encoding out of interrupt context while allowing the QMK
- * main thread to run during most of the WS2812 wire time.
+ * It starts the transfer, then sleeps on a semaphore between required refills.
+ * The DMA ISR remains short: it chains an already-prepared block and signals
+ * the worker only when another refill or final completion must be handled.
+ * This keeps encoding out of interrupt context while allowing the QMK main
+ * thread to run during most of the WS2812 wire time.
  */
 static THD_FUNCTION(ws2812_worker, arg) {
     (void)arg;
@@ -621,7 +628,7 @@ static THD_FUNCTION(ws2812_worker, arg) {
         /* Discard any stale boundary wakeup left by an aborted/finished frame. */
         chSemReset(&ws2812_block_sem, 0);
 
-        /* Pre-fill both buffers before starting DMA */
+        /* Pre-fill the initial DMA buffer(s) before starting DMA. */
         /* Keep one source cursor in wire-byte space instead of reconstructing
          * source offsets from phase/block indices for every fill. */
         const uint8_t *next_src = (const uint8_t *)ws2812_frame_leds;
@@ -654,7 +661,8 @@ static THD_FUNCTION(ws2812_worker, arg) {
         *ws2812_dma_sar_reg  = (uint32_t)ws2812_buf[0];
         *ws2812_dma_ctlh_reg = blk0_size & WB32_DMA_CHCFG_SIZE_MASK;
 
-        /* Re-enable interrupt masks cleared by dmaStreamDisable() at end of previous frame */
+        /* Restore interrupt masks in case the previous transfer ended through
+         * the DMA-disable error/abort path. Normal completion leaves them enabled. */
         dmaStreamEnableInterrupt(ws2812_dma_stream, WB32_DMAC_IT_TFR);
         dmaStreamEnableInterrupt(ws2812_dma_stream, WB32_DMAC_IT_ERR);
 
@@ -683,7 +691,7 @@ static THD_FUNCTION(ws2812_worker, arg) {
          * 2 buffers provide 1-block-period runway (189µs at 27 ticks).
          * Branchless fill (~40µs) stays well ahead of DMA.
          */
-        uint32_t next_fill = 2;  /* Blocks 0–1 already filled */
+        uint32_t next_fill = 2;  /* First up to two blocks are handled above. */
 
         while (ws2812_transfer_active) {
             const msg_t msg = chSemWaitTimeout(
@@ -698,13 +706,12 @@ static THD_FUNCTION(ws2812_worker, arg) {
                 break;
             }
 
-            const uint32_t current = ws2812_block_idx;  /* volatile read */
-
-            /* Normally exactly one block is filled per wakeup. The while form
-             * also catches up if a semaphore signal was already pending. */
-            while (next_fill < WS2812_BLOCK_COUNT &&
-                   current >= (next_fill - 1U)) {
-                const uint32_t slot = next_fill % 2U;
+            /* Each refill wakeup releases exactly one ping-pong slot. The ISR
+             * cannot advance past an unprepared next block because buf_block[]
+             * aborts the transfer on an underrun, so catch-up filling is neither
+             * possible nor necessary. */
+            if (next_fill < WS2812_BLOCK_COUNT) {
+                const uint32_t slot = next_fill & 1U;
                 const uint32_t bytes =
                     (next_fill == (WS2812_BLOCK_COUNT - 1U))
                         ? WS2812_LAST_BLOCK_BYTES
@@ -728,8 +735,9 @@ static THD_FUNCTION(ws2812_worker, arg) {
 /**
  * @brief Queue the current LED frame for asynchronous DMA transmission
  *
- * Normal RGB cadence (~16ms) is much slower than one WS2812 frame (~3ms), so
- * the previous worker is normally already idle. If a caller does arrive early,
+ * Normal RGB cadence (~16ms) is much slower than a typical WS2812 frame
+ * (a few milliseconds), so the previous worker is normally already idle. If a
+ * caller does arrive early,
  * preserve the old serialized semantics with the existing timeout rather than
  * overwriting the snapshot of an in-flight frame.
  */
@@ -751,10 +759,11 @@ void ws2812_flush(void) {
     ws2812_snapshot_frame();
 
     /* Publish the snapshot before waking the worker. chSemSignal() will allow
-     * the higher-priority worker to preempt immediately and build block 0/1. */
+     * the higher-priority worker to preempt immediately and build block 0 and,
+     * when present, block 1. */
     __DMB();
     ws2812_worker_busy = true;
     chSemSignal(&ws2812_start_sem);
 }
 
-#endif /* WB32FQ95xB || WB32FQ95xC */
+#endif /* WB32FQ95xx */
